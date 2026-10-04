@@ -67,6 +67,10 @@ def recording_to_windows(rec: dict, windows_per_rec: int = 4, seed: int = 0) -> 
 def build_dataset(max_recs: int, windows_per_rec: int, held_out_cond: str,
                   test_bearings: list, seed: int = 0):
     df = recordings(load_metadata())
+    # NOTE (ablation 2026-10-04): excluding inner+outer combined bearings (KB23/KB27)
+    # fixes inner-real recall but collapses outer-real (train outer pool shrinks to
+    # one artificial bearing). Kept IN for v1 breadth; proper fix = multi-label head
+    # (inner?/outer? independent) as follow-up. See metrics.json history.
     rng = np.random.default_rng(seed)
     # bearing-independent test split first
     test_mask = df["bearing_id"].isin(test_bearings)
@@ -112,7 +116,7 @@ def main():
     ap.add_argument("--max-recs", type=int, default=120)
     ap.add_argument("--windows-per-rec", type=int, default=8)
     ap.add_argument("--held-out", default="N09_M07_F10")
-    ap.add_argument("--test-bearings", nargs="+", default=["K002", "KB27"])
+    ap.add_argument("--test-bearings", nargs="+", default=["K002", "KI14", "KA15"])
     ap.add_argument("--seed", type=int, default=42)
     a = ap.parse_args()
     if a.smoke:

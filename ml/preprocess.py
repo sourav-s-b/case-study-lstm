@@ -33,12 +33,19 @@ def sliding_windows(x: np.ndarray, win: int = WIN, stride: int = STRIDE) -> np.n
 
 
 def synthesize_aux(vib_rms: float, condition: str, fault: str, n: int, rng: np.random.Generator) -> dict:
-    """Plausible temp/pressure anchored to physics; label as simulated in UI."""
-    rpm, _, radial = COND_BASE.get(condition, (1500, 0.7, 1000))
+    """Plausible temp/pressure anchored to physics; label as simulated in UI.
+
+    Residual encoding (v2): pressure/rpm are emitted MINUS their operating-condition
+    nominal values, so a held-out condition (900rpm/400N) does not look out-of-
+    distribution. Temperature stays absolute (no condition dependence) but is driven
+    mainly by measured vib_rms with only a small direct fault term + heavy noise,
+    so the LSTM cannot cheat off the label and must use vibration/current.
+    """
+    rpm_nom, _, radial = COND_BASE.get(condition, (1500, 0.7, 1000))
     sev = {"healthy": 0.0, "inner": 0.6, "outer": 1.0}.get(fault, 0.0)
-    temp = 46.0 + 4.0 * sev + 1.5 * vib_rms + rng.normal(0, 0.3, n)
-    pressure = radial / 1000.0 + 0.2 * vib_rms * sev + rng.normal(0, 0.02, n)
-    rpm_sig = rpm + rng.normal(0, 5, n)
+    temp = 46.0 + 1.5 * sev + 1.5 * vib_rms + rng.normal(0, 0.8, n)
+    pressure = 0.2 * vib_rms * sev + rng.normal(0, 0.05, n)  # residual around 0
+    rpm_sig = rng.normal(0, 5, n)  # residual around 0
     return {"temperature": temp.astype(np.float32),
             "pressure": pressure.astype(np.float32),
             "rpm": rpm_sig.astype(np.float32)}

@@ -30,7 +30,16 @@ CATALOGUE = [
     {"code": "KI14", "cls": "inner", "origin": "real", "damage": "pitting"},
 ]
 
-_model, _mu, _sd = None, None, None
+_model, _mu, _sd, _bank = None, None, None, None
+
+
+def get_bank():
+    """Real demo windows: {condition_cls: (4, 2048, 6)}. Built by scripts/build_demo_bank.py."""
+    global _bank
+    if _bank is None:
+        import numpy as np
+        _bank = dict(np.load(MODELS / "demo_bank.npz"))
+    return _bank
 
 
 def get_model():
@@ -78,7 +87,9 @@ def infer_window(window) -> dict:
 
 def synth_tick(t: float, condition: str, health_pct: float, fault: str) -> dict:
     sev = 1.0 - health_pct / 100.0
-    vib_rms = 0.5 + 2.0 * sev + 0.1 * math.sin(t) + random.gauss(0, 0.05)
+    # vib_rms scaled to measured Paderborn range (real windows: ~0.1 healthy,
+    # up to ~0.4 faulty) so charts and inference stay consistent.
+    vib_rms = 0.12 + 0.28 * sev + 0.03 * math.sin(t) + random.gauss(0, 0.015)
     current = 2.3 + 0.5 * sev + random.gauss(0, 0.05)
     temp = 46 + 4 * sev + random.gauss(0, 0.2)
     pressure = (1.0 if "F10" in condition else 0.4) + 0.2 * sev + random.gauss(0, 0.02)
@@ -119,19 +130,24 @@ def predict(payload: dict):
             return infer_window(window)
         except Exception:
             pass
-    # feature-based path: build a tiny pseudo-window from scalars, run LSTM
+    # feature-based path: morph between REAL demo windows (healthy <-> fault)
+    # by severity. Fabricated pseudo-windows are OOD for the LSTM; morphing real
+    # Paderborn texture keeps the health slider honest. Falls back to heuristic
+    # if the bank is missing.
     try:
         import numpy as np
         m = get_model()
-        if m is not None:
-            vib = float(payload.get("vib_rms", 0.5 + 2 * sev))
-            cur = float(payload.get("current", 2.3))
-            tmp = float(payload.get("temp", 46 + 4 * sev))
-            prs = float(payload.get("pressure", 1.0))
-            rpm = float(payload.get("rpm", 1500))
-            base = np.array([vib, cur, cur * 0.98, tmp, prs, rpm], np.float32)
-            win = np.tile(base[None, :], (2048, 1))
-            win += np.random.normal(0, 0.01, win.shape).astype(np.float32)
+        bank = get_bank()
+        if m is not None and bank is not None:
+            cond = str(payload.get("condition", "N15_M07_F10"))
+            if cond not in CONDITIONS:
+                cond = "N15_M07_F10"
+            key = fault if fault in ("inner", "outer") else "outer"
+            h = bank[f"{cond}_healthy"]
+            f = bank[f"{cond}_{key}"]
+            i = np.random.randint(len(h))
+            win = ((1 - sev) * h[i] + sev * f[i]).astype(np.float32)
+            win += np.random.normal(0, 1, win.shape).astype(np.float32) * 0.01
             return infer_window(win)
     except Exception:
         pass
@@ -166,6 +182,7 @@ async def stream(ws: WebSocket):
             if tick % 5 == 0:
                 try:
                     probs = predict({"fault": fault, "severity": s["severity"],
+                                     "condition": s["condition"],
                                      "vib_rms": s["vib_rms"], "current": s["current"],
                                      "temp": s["temp"], "pressure": s["pressure"], "rpm": s["rpm"]})
                 except Exception:

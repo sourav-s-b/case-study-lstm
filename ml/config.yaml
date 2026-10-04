@@ -8,5 +8,5 @@ win: 2048
 stride: 512
 fs_target: 12000
 held_out_condition: N09_M07_F10
-test_bearings: [K002, KB27]
+test_bearings: [K002, KI14, KA15]
 seed: 42
