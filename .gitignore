@@ -1,0 +1,30 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Data / models (large, local only)
+data/*
+!data/.gitkeep
+models/*.pt
+models/*.pkl
+*.mat
+*.rar
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Misc
+.env
+*.log
+.DS_Store
