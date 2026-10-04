@@ -30,6 +30,9 @@ from ml.preprocess import synthesize_aux
 WIN = 2048
 STATES = ["healthy", "inner", "outer", "both"]  # inner/outer = *-only; both = inner+outer
 STATE_TO_IDX = {(0, 0): 0, (1, 0): 1, (0, 1): 2, (1, 1): 3}
+CACHE_VERSION = 4  # bump when windowing/synthesis/labels change
+CACHE_DIR = Path(__file__).resolve().parents[1] / "data" / "cache"
+DATA_WORKERS = 8  # parquet reads are I/O-bound; threads overlap them ~5x faster
 
 
 class SmallLSTM(nn.Module):
@@ -72,10 +75,17 @@ def recording_to_windows(rec: dict, windows_per_rec: int = 4, seed: int = 0) -> 
     W = np.stack([np.stack([vib[s:s + WIN], i1[s:s + WIN], i2[s:s + WIN]], axis=-1)
                   for s in starts]).astype(np.float32)  # (W,WIN,3)
     rms = np.sqrt((W[:, :, 0] ** 2).mean(axis=1))
-    aux = np.zeros((len(starts), WIN, 3), dtype=np.float32)
-    for k in range(len(starts)):
-        s = synthesize_aux(float(rms[k]), rec["operating_condition"], rec["cls"], WIN, rng)
-        aux[k, :, 0], aux[k, :, 1], aux[k, :, 2] = s["temperature"], s["pressure"], s["rpm"]
+    # vectorized aux synthesis: one RNG draw per channel for all windows.
+    # (residual encoding: pressure/rpm centered on condition nominals,
+    # temp driven by measured rms + small fault term + heavy noise)
+    sev = {"healthy": 0.0, "inner": 0.6, "outer": 1.0}.get(rec["cls"], 0.0)
+    nw = len(starts)
+    temp = (46.0 + 1.5 * sev + 1.5 * rms[:, None]
+            + rng.normal(0, 0.8, (nw, WIN))).astype(np.float32)
+    press = (0.2 * rms[:, None] * sev
+             + rng.normal(0, 0.05, (nw, WIN))).astype(np.float32)
+    rpm = rng.normal(0, 5, (nw, WIN)).astype(np.float32)
+    aux = np.stack([temp, press, rpm], axis=-1)
     return np.concatenate([W, aux], axis=-1)
 
 
@@ -97,25 +107,39 @@ def build_dataset(max_recs: int, windows_per_rec: int, held_out_cond: str,
     val = cap(val, max(8, max_recs // 3))
     test = cap(df[test_mask], max(8, max_recs // 3))
 
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(rec, rep):
+        try:
+            X = recording_to_windows(rec, windows_per_rec, seed=int(rec["repetition"]) + 100 * rep)
+        except Exception as e:
+            print(f"skip {rec['bearing_id']} {rec['operating_condition']} "
+                  f"r{rec['repetition']}: {e}", flush=True)
+            return None
+        y = STATE_TO_IDX[(rec["ml_inner"], rec["ml_outer"])]
+        return X, [y] * len(X), [rec["operating_condition"]] * len(X), [rec["bearing_id"]] * len(X)
+
     def stack(frame):
-        Xs, ys, conds, bids = [], [], [], []
+        jobs = []
         for _, rec in frame.iterrows():
-            # oversample the rare "both" state (only 2 bearings dataset-wide):
-            # same recording, different window offsets per repeat.
-            is_both = bool(rec["ml_inner"] and rec["ml_outer"])
-            reps = both_repeats if is_both else 1
-            for r in range(reps):
-                try:
-                    X = recording_to_windows(rec.to_dict(), windows_per_rec,
-                                             seed=int(rec["repetition"]) + 100 * r)
-                except Exception as e:
-                    print(f"skip {rec['bearing_id']} {rec['operating_condition']} "
-                          f"r{rec['repetition']}: {e}", flush=True)
+            d = rec.to_dict()
+            is_both = bool(d["ml_inner"] and d["ml_outer"])
+            for r in range(both_repeats if is_both else 1):
+                jobs.append((d, r))
+        Xs, ys, conds, bids = [], [], [], []
+        t0 = _time.time()
+        with ThreadPoolExecutor(max_workers=DATA_WORKERS) as ex:
+            for i, res in enumerate(ex.map(lambda j: one(*j), jobs)):
+                if res is None:
                     continue
+                X, y, c, b = res
                 Xs.append(X)
-                ys += [STATE_TO_IDX[(rec["ml_inner"], rec["ml_outer"])]] * len(X)
-                conds += [rec["operating_condition"]] * len(X)
-                bids += [rec["bearing_id"]] * len(X)
+                ys += y
+                conds += c
+                bids += b
+                if (i + 1) % 50 == 0 or (i + 1) == len(jobs):
+                    print(f"  ...{i + 1}/{len(jobs)} recs [{_time.time() - t0:.0f}s]", flush=True)
         if not Xs:
             raise RuntimeError("no windows built — check data path")
         return np.concatenate(Xs), np.array(ys), conds, bids
@@ -127,10 +151,46 @@ def normalize_fit(Xtr):
     return mu.astype(np.float32), sd.astype(np.float32)
 
 
-def predict_proba(model, X):
+def cache_key(dataset, max_recs, windows_per_rec, held_out, test_bearings, seed, both_repeats):
+    import hashlib
+    raw = f"v{CACHE_VERSION}|{dataset}|{max_recs}|{windows_per_rec}|{held_out}|" \
+          f"{','.join(sorted(test_bearings))}|{seed}|{both_repeats}"
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+
+def load_or_build(dataset, max_recs, windows_per_rec, held_out, test_bearings,
+                  seed, both_repeats):
+    """Window cache: parquet reads + synthesis run once, reused across runs."""
+    import time
+    key = cache_key(dataset, max_recs, windows_per_rec, held_out,
+                    test_bearings, seed, both_repeats)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = CACHE_DIR / f"windows_{key}.npz"
+    if path.exists():
+        t0 = time.time()
+        z = np.load(path, allow_pickle=True)
+        print(f"cache HIT {path.name} ({time.time() - t0:.1f}s)", flush=True)
+        return ((z["Xtr"], z["ytr"], None, None), (z["Xva"], z["yva"], None, None),
+                (z["Xte"], z["yte"], z["cte"].tolist(), z["bte"].tolist()))
+    t0 = time.time()
+    out = build_dataset(max_recs, windows_per_rec, held_out, test_bearings, seed, both_repeats)
+    (Xtr, ytr, _, _), (Xva, yva, _, _), (Xte, yte, cte, bte) = out
+    np.savez_compressed(path, Xtr=Xtr, ytr=ytr, Xva=Xva, yva=yva,
+                        Xte=Xte, yte=yte,
+                        cte=np.array(cte, dtype=object), bte=np.array(bte, dtype=object))
+    print(f"cache MISS — built + saved {path.name} ({time.time() - t0:.1f}s)", flush=True)
+    return out
+
+
+def predict_proba(model, X, device="cpu", batch=256):
+    """Batched softmax inference — never OOMs on full val/test sets."""
     model.eval()
+    outs = []
     with torch.no_grad():
-        return torch.softmax(model(torch.from_numpy(X)), -1).numpy()
+        for i in range(0, len(X), batch):
+            xb = torch.from_numpy(X[i:i + batch]).to(device)
+            outs.append(torch.softmax(model(xb), -1).cpu().numpy())
+    return np.concatenate(outs)
 
 
 def marginals(probs):
@@ -173,15 +233,47 @@ def main():
     ap.add_argument("--test-bearings", nargs="+", default=["K002", "KI14", "KA15", "KB27"])
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--batch-size", type=int, default=64,
+                    help="64 + full precision is the quality-validated setting")
+    ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
+                    help="auto = RTX GPU if available (10-30x faster than CPU)")
+    ap.add_argument("--no-cache", action="store_true", help="rebuild windows from parquet")
+    ap.add_argument("--early-stop", type=int, default=0,
+                    help="stop if val_exact stalls N epochs (0 = off)")
     ap.add_argument("--both-repeats", type=int, default=4,
                     help="oversample repeats for the rare both state (2 bearings dataset-wide)")
+    ap.add_argument("--amp", action="store_true",
+                    help="mixed precision (faster, but ablation showed outer->both collapse)")
     a = ap.parse_args()
     if a.smoke:
         a.epochs, a.max_recs, a.windows_per_rec = 2, 24, 4
     torch.manual_seed(a.seed)
+    import os, time
+    device = (a.device if a.device != "auto"
+              else ("cuda" if torch.cuda.is_available() else "cpu"))
+    dataset = os.environ.get("DATASET", "paderborn_small")
     print(f"seed={a.seed} held_out={a.held_out} test={a.test_bearings} states={STATES}", flush=True)
-    (Xtr, ytr, _, _), (Xva, yva, _, _), (Xte, yte, cte, bte) = build_dataset(
-        a.max_recs, a.windows_per_rec, a.held_out, a.test_bearings, a.seed, a.both_repeats)
+    print(f"device={device} batch={a.batch_size} dataset={dataset}", flush=True)
+    import logging
+    logpath = Path("models") / "train.log"
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S",
+        handlers=[logging.FileHandler(logpath), logging.StreamHandler()], force=True)
+    log = logging.getLogger("train")
+    log.info(f"seed={a.seed} held_out={a.held_out} test={a.test_bearings} states={STATES}")
+    log.info(f"device={device} batch={a.batch_size} dataset={dataset} both_repeats={a.both_repeats}")
+    if device == "cuda":
+        log.info(f"gpu={torch.cuda.get_device_name(0)} "
+                 f"mem={torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
+    t0 = time.time()
+    if a.no_cache:
+        out = build_dataset(a.max_recs, a.windows_per_rec, a.held_out,
+                            a.test_bearings, a.seed, a.both_repeats)
+    else:
+        out = load_or_build(dataset, a.max_recs, a.windows_per_rec, a.held_out,
+                            a.test_bearings, a.seed, a.both_repeats)
+    (Xtr, ytr, _, _), (Xva, yva, _, _), (Xte, yte, cte, bte) = out
+    print(f"data ready in {time.time() - t0:.1f}s", flush=True)
     mu, sd = normalize_fit(Xtr)
     Xtr, Xva, Xte = (Xtr - mu) / sd, (Xva - mu) / sd, (Xte - mu) / sd
     print(f"train {Xtr.shape} class_counts={np.bincount(ytr, minlength=4).tolist()}", flush=True)
@@ -189,44 +281,76 @@ def main():
     print(f"test  {Xte.shape} class_counts={np.bincount(yte, minlength=4).tolist()}", flush=True)
 
     train_ds = DataLoader(TensorDataset(torch.from_numpy(Xtr), torch.from_numpy(ytr)),
-                          batch_size=64, shuffle=True)
-    model = SmallLSTM()
+                          batch_size=a.batch_size, shuffle=True)
+    model = SmallLSTM().to(device)
     opt = torch.optim.Adam(model.parameters(), lr=a.lr)
     counts = np.bincount(ytr, minlength=4)
     w = counts.sum() / (4 * np.maximum(counts, 1))
-    loss_fn = nn.CrossEntropyLoss(weight=torch.tensor(w, dtype=torch.float32))
+    loss_fn = nn.CrossEntropyLoss(weight=torch.tensor(w, dtype=torch.float32).to(device))
+    use_amp = (device == "cuda" and a.amp)
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
+    best, stale = -1.0, 0
+    t0 = time.time()
+    from tqdm import tqdm
     for ep in range(a.epochs):
         model.train()
         tot = 0.0
-        for xb, yb in train_ds:
+        bar = tqdm(train_ds, desc=f"ep{ep + 1}/{a.epochs} train", leave=False,
+                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
+        for xb, yb in bar:
+            xb, yb = xb.to(device), yb.to(device)
             opt.zero_grad()
-            loss = loss_fn(model(xb), yb)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+            if use_amp:
+                with torch.autocast("cuda"):
+                    loss = loss_fn(model(xb), yb)
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss = loss_fn(model(xb), yb)
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
             tot += loss.item() * len(xb)
-        pv = predict_proba(model, Xva).argmax(1)
-        print(f"ep{ep + 1}/{a.epochs} loss={tot / len(Xtr):.4f} "
-              f"val_exact={(pv == yva).mean():.3f}", flush=True)
+            bar.set_postfix(loss=f"{loss.item():.4f}")
+        pv = predict_proba(model, Xva, device).argmax(1)
+        vacc = (pv == yva).mean()
+        log.info(f"ep{ep + 1}/{a.epochs} loss={tot / len(Xtr):.4f} "
+                 f"val_exact={vacc:.3f} [{time.time() - t0:.0f}s]")
+        if a.early_stop:
+            if vacc > best + 1e-4:
+                best, stale = vacc, 0
+            else:
+                stale += 1
+                if stale >= a.early_stop:
+                    print(f"early stop at ep{ep + 1} (best val_exact={best:.3f})", flush=True)
+                    break
 
     print("--- validation (held-out condition) ---", flush=True)
-    val_m = report("VAL", yva, predict_proba(model, Xva))
+    val_m = report("VAL", yva, predict_proba(model, Xva, device))
     print("--- test (held-out bearings) ---", flush=True)
-    test_m = report("TEST", yte, predict_proba(model, Xte), conds=cte)
+    test_m = report("TEST", yte, predict_proba(model, Xte, device), conds=cte)
     print("--- test by bearing ---", flush=True)
     for b in sorted(set(bte)):
         idx = [i for i, x in enumerate(bte) if x == b]
-        yt, probs = yte[idx], predict_proba(model, Xte[idx])
+        yt, probs = yte[idx], predict_proba(model, Xte[idx], device)
         print(f"   {b}: exact={(probs.argmax(1) == yt).mean():.3f} n={len(idx)} "
               f"true_state={STATES[int(yt[0])]}", flush=True)
 
     out = Path("models")
     out.mkdir(exist_ok=True)
+    # Smoke runs must NEVER overwrite the production weights (previous
+    # incidents: 2-epoch smoke clobbered the good full-data model twice).
+    tag = "smoke_" if a.smoke else ""
     torch.save({"model": model.state_dict(), "mu": mu, "sd": sd,
-                "states": STATES, "joint_states": True}, out / "lstm_small.pt")
+                "states": STATES, "joint_states": True}, out / f"{tag}lstm_small.pt")
     json.dump({"joint_states": STATES, "val": val_m, "test": test_m},
-              open(out / "metrics.json", "w"), indent=2)
-    print("saved models/lstm_small.pt + metrics.json", flush=True)
+              open(out / f"{tag}metrics.json", "w"), indent=2)
+    log.info(f"FINAL val={val_m} test={test_m}")
+    print(f"saved {out / (tag + 'lstm_small.pt')} + {tag}metrics.json "
+          f"(full log: {logpath})", flush=True)
 
 
 if __name__ == "__main__":
