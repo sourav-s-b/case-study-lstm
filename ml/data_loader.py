@@ -13,13 +13,21 @@ from pathlib import Path
 import pandas as pd
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / "data"
-SUBSET = DATA_ROOT / "paderborn_small"
+# DATASET=paderborn selects the full 32-bearing build; default is the 8-bearing
+# smart subset. Both share the bearing-datasets schema. Demo bank + scripts
+# honor the same variable.
+import os as _os
+SUBSET = DATA_ROOT / _os.environ.get("DATASET", "paderborn_small")
 
 # fault_type values in metadata: normal / inner / outer / inner+outer (KB23, KB27).
-# For the 3-class LSTM, combined maps to outer (flagged via is_combined).
+# Single-label mapping kept for compat; multi-label is the real target:
+# healthy=[0,0], inner=[1,0], outer=[0,1], combined=[1,1].
 FAULT_TO_CLASS = {"normal": "healthy", "inner": "inner",
                   "outer": "outer", "inner+outer": "outer"}
+FAULT_TO_MULTILABEL = {"normal": (0, 0), "inner": (1, 0),
+                       "outer": (0, 1), "inner+outer": (1, 1)}
 CLASS_TO_IDX = {"healthy": 0, "inner": 1, "outer": 2}
+LABELS = ["inner", "outer"]
 
 CONDITIONS = ["N15_M07_F10", "N09_M07_F10", "N15_M01_F10", "N15_M07_F04"]
 
@@ -33,14 +41,18 @@ def load_metadata(root: Path = SUBSET) -> pd.DataFrame:
     df["cls"] = df["fault_type"].map(FAULT_TO_CLASS).fillna("unknown")
     df["is_combined"] = df["fault_type"] == "inner+outer"
     df["label"] = df["cls"].map(CLASS_TO_IDX)
+    df[["ml_inner", "ml_outer"]] = pd.DataFrame(
+        df["fault_type"].map(FAULT_TO_MULTILABEL).tolist(), index=df.index)
     return df
 
 
 def recordings(df: pd.DataFrame) -> pd.DataFrame:
     """One row per recording (bearing x condition x repetition)."""
     cols = ["bearing_id", "operating_condition", "repetition",
-            "cls", "label", "is_combined", "fault_origin", "damage"]
-    return df.drop_duplicates(subset=["bearing_id", "operating_condition", "repetition"]).copy()
+            "cls", "label", "ml_inner", "ml_outer",
+            "is_combined", "fault_origin", "damage"]
+    recs = df.drop_duplicates(subset=["bearing_id", "operating_condition", "repetition"]).copy()
+    return recs[[c for c in cols if c in recs.columns]]
 
 
 def read_signal(signal_id: str, root: Path = SUBSET):

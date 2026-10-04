@@ -13,6 +13,7 @@ wheels/
 data/*
 !data/.gitkeep
 models/*.pt
+!models/lstm_small.pt
 models/*.pkl
 *.mat
 *.rar

@@ -1,8 +1,19 @@
-"""Small LSTM: (B, 2048, 6) -> Healthy/IR/OR. CPU-trainable.
+"""Small 4-state LSTM: (B, 2048, 6) -> {healthy, inner-only, outer-only, both}.
+
+Why 4-state softmax instead of 2-head BCE (evidence, 2026-10-04):
+  - 2-head BCE trained 27 epochs: inner-F1 0.82, outer-F1 0.000. The outer head
+    died (P(outer)~0.01 on every state) — the shared trunk converged to features
+    where all fault evidence routes through the inner head, and the dead head
+    never recovers (sigmoid saturation + no competitive pressure).
+  - The earlier 3-class softmax run had outer perfect (KA15 104/104), proving the
+    signature IS learnable when heads compete.
+  - Joint-state softmax is exact here (every window is in exactly one joint
+    state); marginals P(inner)=P(inner-only)+P(both) give multi-label-style
+    outputs for the UI. KB23/KB27 train honestly as "both".
 
 Usage:
-  uv run python ml/train_lstm.py --smoke            # 24 recs, 2 epochs, ~2min
-  uv run python ml/train_lstm.py --epochs 10 --max-recs 120 --windows-per-rec 8
+  uv run python -m ml.train_lstm --smoke
+  uv run python -m ml.train_lstm --epochs 12 --max-recs 120 --windows-per-rec 8
 """
 from __future__ import annotations
 import argparse, json
@@ -11,22 +22,26 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
-from sklearn.metrics import f1_score, confusion_matrix
+from sklearn.metrics import f1_score
 
-from ml.data_loader import load_metadata, recordings, read_signal, CLASS_TO_IDX
-from ml.preprocess import synthesize_aux, COND_BASE
+from ml.data_loader import load_metadata, recordings, read_signal
+from ml.preprocess import synthesize_aux
 
 WIN = 2048
+STATES = ["healthy", "inner", "outer", "both"]  # inner/outer = *-only; both = inner+outer
+STATE_TO_IDX = {(0, 0): 0, (1, 0): 1, (0, 1): 2, (1, 1): 3}
 
 
 class SmallLSTM(nn.Module):
+    """Shared trunk, 4-way joint-state head. ~54k params."""
+
     def __init__(self, n_feat: int = 6, hidden: int = 64, layers: int = 2,
-                 dropout: float = 0.3, n_class: int = 3):
+                 dropout: float = 0.3, n_states: int = 4):
         super().__init__()
         self.lstm = nn.LSTM(n_feat, hidden, layers, batch_first=True, dropout=dropout)
         self.norm = nn.LayerNorm(hidden)
         self.head = nn.Sequential(nn.Linear(hidden, 32), nn.ReLU(),
-                                  nn.Dropout(dropout), nn.Linear(32, n_class))
+                                  nn.Dropout(dropout), nn.Linear(32, n_states))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, (h, _) = self.lstm(x)
@@ -34,8 +49,9 @@ class SmallLSTM(nn.Module):
 
 
 def decimate(x: np.ndarray, factor: int = 5) -> np.ndarray:
-    # 64kHz -> 12.8kHz fast path for smoke/full training (no FIR, fine for prototype).
-    # Center-crop to multiple of factor first for stable lengths.
+    # 64kHz -> 12.8kHz plain slicing. (Ablation 2026-10-04: FIR anti-alias
+    # decimation changed input scale, destabilized Adam at lr=1e-3 and collapsed
+    # healthy recall to 0. Revisit with retuned LR if spectral purity matters.)
     n = len(x) - (len(x) % factor)
     return x[:n:factor].astype(np.float32)
 
@@ -49,7 +65,6 @@ def recording_to_windows(rec: dict, windows_per_rec: int = 4, seed: int = 0) -> 
     i2 = decimate(read_signal(f"{rid}/phase_current_2"))
     n = min(len(vib), len(i1), len(i2))
     vib, i1, i2 = vib[:n], i1[:n], i2[:n]
-    # evenly spaced window starts across the recording
     max_start = n - WIN
     if max_start <= 0:
         raise ValueError(f"recording too short: {rid} n={n}")
@@ -65,21 +80,16 @@ def recording_to_windows(rec: dict, windows_per_rec: int = 4, seed: int = 0) -> 
 
 
 def build_dataset(max_recs: int, windows_per_rec: int, held_out_cond: str,
-                  test_bearings: list, seed: int = 0):
+                  test_bearings: list, seed: int = 0, both_repeats: int = 4):
     df = recordings(load_metadata())
-    # NOTE (ablation 2026-10-04): excluding inner+outer combined bearings (KB23/KB27)
-    # fixes inner-real recall but collapses outer-real (train outer pool shrinks to
-    # one artificial bearing). Kept IN for v1 breadth; proper fix = multi-label head
-    # (inner?/outer? independent) as follow-up. See metrics.json history.
-    rng = np.random.default_rng(seed)
-    # bearing-independent test split first
     test_mask = df["bearing_id"].isin(test_bearings)
     rest = df[~test_mask]
-    # cap recs per split for memory safety, stratified by cls
+
     def cap(frame, n):
         if len(frame) > n:
             return frame.sample(n, random_state=seed)
         return frame
+
     # leave-one-condition-out: val = held_out condition
     val = rest[rest.operating_condition == held_out_cond]
     train_pool = rest[rest.operating_condition != held_out_cond]
@@ -88,19 +98,27 @@ def build_dataset(max_recs: int, windows_per_rec: int, held_out_cond: str,
     test = cap(df[test_mask], max(8, max_recs // 3))
 
     def stack(frame):
-        Xs, ys, conds = [], [], []
+        Xs, ys, conds, bids = [], [], [], []
         for _, rec in frame.iterrows():
-            try:
-                X = recording_to_windows(rec.to_dict(), windows_per_rec, seed=int(rec["repetition"]))
-            except Exception as e:
-                print(f"skip {rec['bearing_id']} {rec['operating_condition']} r{rec['repetition']}: {e}")
-                continue
-            Xs.append(X)
-            ys += [CLASS_TO_IDX[rec["cls"]]] * len(X)
-            conds += [rec["operating_condition"]] * len(X)
+            # oversample the rare "both" state (only 2 bearings dataset-wide):
+            # same recording, different window offsets per repeat.
+            is_both = bool(rec["ml_inner"] and rec["ml_outer"])
+            reps = both_repeats if is_both else 1
+            for r in range(reps):
+                try:
+                    X = recording_to_windows(rec.to_dict(), windows_per_rec,
+                                             seed=int(rec["repetition"]) + 100 * r)
+                except Exception as e:
+                    print(f"skip {rec['bearing_id']} {rec['operating_condition']} "
+                          f"r{rec['repetition']}: {e}", flush=True)
+                    continue
+                Xs.append(X)
+                ys += [STATE_TO_IDX[(rec["ml_inner"], rec["ml_outer"])]] * len(X)
+                conds += [rec["operating_condition"]] * len(X)
+                bids += [rec["bearing_id"]] * len(X)
         if not Xs:
             raise RuntimeError("no windows built — check data path")
-        return np.concatenate(Xs), np.array(ys), conds
+        return np.concatenate(Xs), np.array(ys), conds, bids
     return (stack(train), stack(val), stack(test))
 
 
@@ -109,31 +127,73 @@ def normalize_fit(Xtr):
     return mu.astype(np.float32), sd.astype(np.float32)
 
 
+def predict_proba(model, X):
+    model.eval()
+    with torch.no_grad():
+        return torch.softmax(model(torch.from_numpy(X)), -1).numpy()
+
+
+def marginals(probs):
+    """4-state probs -> multi-label-style {healthy, inner, outer, anomaly, both}."""
+    ph, pi, po, pb = probs[:, 0], probs[:, 1], probs[:, 2], probs[:, 3]
+    return {"healthy": ph, "inner": pi + pb, "outer": po + pb,
+            "anomaly": 1 - ph, "both": pb}
+
+
+def report(name, y_true, probs, conds=None):
+    pred = probs.argmax(1)
+    exact = (pred == y_true).mean()
+    m = marginals(probs)
+    inner_true = ((y_true == 1) | (y_true == 3)).astype(int)
+    outer_true = ((y_true == 2) | (y_true == 3)).astype(int)
+    f_in = f1_score(inner_true, (m["inner"] > 0.5).astype(int), zero_division=0)
+    f_out = f1_score(outer_true, (m["outer"] > 0.5).astype(int), zero_division=0)
+    f_fault = f1_score((y_true > 0).astype(int), (pred > 0).astype(int), zero_division=0)
+    print(f"[{name}] exact={exact:.3f} marginal inner-F1={f_in:.3f} "
+          f"outer-F1={f_out:.3f} faulty-vs-healthy-F1={f_fault:.3f} n={len(y_true)}", flush=True)
+    for s, sname in enumerate(STATES):
+        idx = np.where(y_true == s)[0]
+        if len(idx):
+            print(f"   {sname}: recall={(pred[idx] == s).mean():.3f} n={len(idx)}", flush=True)
+    if conds is not None:
+        for c in sorted(set(conds)):
+            idx = [i for i, x in enumerate(conds) if x == c]
+            print(f"   @{c}: exact={(pred[idx] == y_true[idx]).mean():.3f} n={len(idx)}", flush=True)
+    return {"exact": float(exact), "inner_f1": float(f_in),
+            "outer_f1": float(f_out), "fault_f1": float(f_fault)}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--smoke", action="store_true")
-    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--max-recs", type=int, default=120)
     ap.add_argument("--windows-per-rec", type=int, default=8)
     ap.add_argument("--held-out", default="N09_M07_F10")
-    ap.add_argument("--test-bearings", nargs="+", default=["K002", "KI14", "KA15"])
+    ap.add_argument("--test-bearings", nargs="+", default=["K002", "KI14", "KA15", "KB27"])
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--both-repeats", type=int, default=4,
+                    help="oversample repeats for the rare both state (2 bearings dataset-wide)")
     a = ap.parse_args()
     if a.smoke:
         a.epochs, a.max_recs, a.windows_per_rec = 2, 24, 4
     torch.manual_seed(a.seed)
-    (Xtr, ytr, _), (Xva, yva, cva), (Xte, yte, cte) = build_dataset(
-        a.max_recs, a.windows_per_rec, a.held_out, a.test_bearings, a.seed)
+    print(f"seed={a.seed} held_out={a.held_out} test={a.test_bearings} states={STATES}", flush=True)
+    (Xtr, ytr, _, _), (Xva, yva, _, _), (Xte, yte, cte, bte) = build_dataset(
+        a.max_recs, a.windows_per_rec, a.held_out, a.test_bearings, a.seed, a.both_repeats)
     mu, sd = normalize_fit(Xtr)
     Xtr, Xva, Xte = (Xtr - mu) / sd, (Xva - mu) / sd, (Xte - mu) / sd
-    print(f"train {Xtr.shape} val {Xva.shape} test {Xte.shape}")
+    print(f"train {Xtr.shape} class_counts={np.bincount(ytr, minlength=4).tolist()}", flush=True)
+    print(f"val   {Xva.shape} class_counts={np.bincount(yva, minlength=4).tolist()}", flush=True)
+    print(f"test  {Xte.shape} class_counts={np.bincount(yte, minlength=4).tolist()}", flush=True)
 
     train_ds = DataLoader(TensorDataset(torch.from_numpy(Xtr), torch.from_numpy(ytr)),
                           batch_size=64, shuffle=True)
     model = SmallLSTM()
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-    counts = np.bincount(ytr, minlength=3)
-    w = (counts.sum() / (3 * np.maximum(counts, 1)))
+    opt = torch.optim.Adam(model.parameters(), lr=a.lr)
+    counts = np.bincount(ytr, minlength=4)
+    w = counts.sum() / (4 * np.maximum(counts, 1))
     loss_fn = nn.CrossEntropyLoss(weight=torch.tensor(w, dtype=torch.float32))
     for ep in range(a.epochs):
         model.train()
@@ -142,30 +202,31 @@ def main():
             opt.zero_grad()
             loss = loss_fn(model(xb), yb)
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             tot += loss.item() * len(xb)
-        model.eval()
-        with torch.no_grad():
-            pv = model(torch.from_numpy(Xva)).argmax(1).numpy()
-        print(f"ep{ep+1}/{a.epochs} loss={tot/len(Xtr):.4f} valF1={f1_score(yva, pv, average='macro'):.3f}")
+        pv = predict_proba(model, Xva).argmax(1)
+        print(f"ep{ep + 1}/{a.epochs} loss={tot / len(Xtr):.4f} "
+              f"val_exact={(pv == yva).mean():.3f}", flush=True)
 
-    model.eval()
-    with torch.no_grad():
-        pt = model(torch.from_numpy(Xte)).argmax(1).numpy()
-        pv = model(torch.from_numpy(Xva)).argmax(1).numpy()
-    print("VAL cm:\n", confusion_matrix(yva, pv))
-    print("TEST cm:\n", confusion_matrix(yte, pt))
-    for c in sorted(set(cte)):
-        idx = [i for i, x in enumerate(cte) if x == c]
-        print(f"test@{c}: F1={f1_score(yte[idx], pt[idx], average='macro'):.3f} n={len(idx)}")
+    print("--- validation (held-out condition) ---", flush=True)
+    val_m = report("VAL", yva, predict_proba(model, Xva))
+    print("--- test (held-out bearings) ---", flush=True)
+    test_m = report("TEST", yte, predict_proba(model, Xte), conds=cte)
+    print("--- test by bearing ---", flush=True)
+    for b in sorted(set(bte)):
+        idx = [i for i, x in enumerate(bte) if x == b]
+        yt, probs = yte[idx], predict_proba(model, Xte[idx])
+        print(f"   {b}: exact={(probs.argmax(1) == yt).mean():.3f} n={len(idx)} "
+              f"true_state={STATES[int(yt[0])]}", flush=True)
+
     out = Path("models")
     out.mkdir(exist_ok=True)
     torch.save({"model": model.state_dict(), "mu": mu, "sd": sd,
-                "classes": ["healthy", "inner", "outer"]}, out / "lstm_small.pt")
-    json.dump({"val_f1": float(f1_score(yva, pv, average="macro")),
-               "test_f1": float(f1_score(yte, pt, average="macro"))},
+                "states": STATES, "joint_states": True}, out / "lstm_small.pt")
+    json.dump({"joint_states": STATES, "val": val_m, "test": test_m},
               open(out / "metrics.json", "w"), indent=2)
-    print("saved models/lstm_small.pt + metrics.json")
+    print("saved models/lstm_small.pt + metrics.json", flush=True)
 
 
 if __name__ == "__main__":

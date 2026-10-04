@@ -6,7 +6,7 @@ import {
 const API = "http://localhost:8000";
 const WS_URL = "ws://localhost:8000/simulate/stream";
 const CONDITIONS = ["N15_M07_F10", "N09_M07_F10", "N15_M01_F10", "N15_M07_F04"];
-const FAULTS = ["healthy", "inner", "outer"];
+const FAULTS = ["healthy", "inner", "outer", "combined"];
 
 /* ---------- bearing + LSTM visuals ---------- */
 function BearingSVG({ anomaly }) {

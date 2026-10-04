@@ -69,7 +69,7 @@ def heuristic_probs(sev: float, fault: str) -> dict:
 
 
 def infer_window(window) -> dict:
-    """window: (2048, 6) array-like. Returns probs + anomaly."""
+    """window: (2048, 6) array-like. 4-state softmax -> multi-label-style marginals."""
     m = get_model()
     if m is None:
         raise RuntimeError("no model")
@@ -80,9 +80,10 @@ def infer_window(window) -> dict:
     with torch.no_grad():
         logits = m(torch.from_numpy(x[None]))
         p = torch.softmax(logits, -1).numpy()[0]
-    d = {c: float(p[i]) for i, c in enumerate(CLASSES)}
-    d["anomaly"] = float(1 - p[0])
-    return d
+    ph, pi, po, pb = (float(v) for v in p)
+    inner, outer = pi + pb, po + pb
+    return {"inner": inner, "outer": outer, "healthy": ph,
+            "anomaly": float(1 - ph), "both": bool(pb > 0.5), "p_both": pb}
 
 
 def synth_tick(t: float, condition: str, health_pct: float, fault: str) -> dict:
@@ -142,11 +143,16 @@ def predict(payload: dict):
             cond = str(payload.get("condition", "N15_M07_F10"))
             if cond not in CONDITIONS:
                 cond = "N15_M07_F10"
-            key = fault if fault in ("inner", "outer") else "outer"
+            key = fault if fault in ("inner", "outer", "combined") else "outer"
             h = bank[f"{cond}_healthy"]
-            f = bank[f"{cond}_{key}"]
             i = np.random.randint(len(h))
-            win = ((1 - sev) * h[i] + sev * f[i]).astype(np.float32)
+            if key == "combined":
+                # both races damaged: mix of the two pure fault textures
+                f1, f2 = bank[f"{cond}_inner"], bank[f"{cond}_outer"]
+                fwin = (0.5 * f1[i] + 0.5 * f2[i]).astype(np.float32)
+            else:
+                fwin = bank[f"{cond}_{key}"][i]
+            win = ((1 - sev) * h[i] + sev * fwin).astype(np.float32)
             win += np.random.normal(0, 1, win.shape).astype(np.float32) * 0.01
             return infer_window(win)
     except Exception:
@@ -188,7 +194,8 @@ async def stream(ws: WebSocket):
                 except Exception:
                     probs = heuristic_probs(s["severity"], fault)
                 s["probs"] = probs
-                s["pred"] = max(("healthy", "inner", "outer"), key=lambda k: probs[k])
+                s["pred"] = ("combined" if probs.get("both")
+                             else max(("healthy", "inner", "outer"), key=lambda k: probs[k]))
             await ws.send_json(s)
             t += 0.1
             tick += 1
