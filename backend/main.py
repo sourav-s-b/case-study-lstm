@@ -131,10 +131,10 @@ def predict(payload: dict):
             return infer_window(window)
         except Exception:
             pass
-    # feature-based path: morph between REAL demo windows (healthy <-> fault)
-    # by severity. Fabricated pseudo-windows are OOD for the LSTM; morphing real
-    # Paderborn texture keeps the health slider honest. Falls back to heuristic
-    # if the bank is missing.
+    # feature-based path: severity LADDER of real demo windows. v1 morphed
+    # healthy<->fault along a line and the model read midpoints as the wrong
+    # race; v2 picks a genuine window from the matching severity rung, so the
+    # selected fault reads faithfully at every slider stop.
     try:
         import numpy as np
         m = get_model()
@@ -143,17 +143,19 @@ def predict(payload: dict):
             cond = str(payload.get("condition", "N15_M07_F10"))
             if cond not in CONDITIONS:
                 cond = "N15_M07_F10"
-            key = fault if fault in ("inner", "outer", "combined") else "outer"
-            h = bank[f"{cond}_healthy"]
-            i = np.random.randint(len(h))
-            if key == "combined":
-                # both races damaged: mix of the two pure fault textures
-                f1, f2 = bank[f"{cond}_inner"], bank[f"{cond}_outer"]
-                fwin = (0.5 * f1[i] + 0.5 * f2[i]).astype(np.float32)
+            key = fault if fault in ("healthy", "inner", "outer", "combined") else "outer"
+            health = 100 * (1 - sev)
+            if key == "healthy":
+                # no fault injected: the machine stays healthy all along the slider
+                rung = bank[f"{cond}_healthy"]
+            elif health > 66:
+                rung = bank[f"{cond}_healthy"]
+            elif health > 33:
+                rung = bank[f"{cond}_{'both' if key == 'combined' else key}_mild"]
             else:
-                fwin = bank[f"{cond}_{key}"][i]
-            win = ((1 - sev) * h[i] + sev * fwin).astype(np.float32)
-            win += np.random.normal(0, 1, win.shape).astype(np.float32) * 0.01
+                rung = bank[f"{cond}_{'both' if key == 'combined' else key}_severe"]
+            win = rung[np.random.randint(len(rung))].astype(np.float32)
+            win += np.random.normal(0, 1, win.shape).astype(np.float32) * 0.005
             return infer_window(win)
     except Exception:
         pass
