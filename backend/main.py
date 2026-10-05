@@ -83,7 +83,8 @@ def infer_window(window) -> dict:
     ph, pi, po, pb = (float(v) for v in p)
     inner, outer = pi + pb, po + pb
     return {"inner": inner, "outer": outer, "healthy": ph,
-            "anomaly": float(1 - ph), "both": bool(pb > 0.5), "p_both": pb}
+            "anomaly": float(1 - ph), "both": bool(pb > 0.5), "p_both": pb,
+            "p_inner": pi, "p_outer": po, "p_healthy": ph}
 
 
 def synth_tick(t: float, condition: str, health_pct: float, fault: str) -> dict:
@@ -123,43 +124,64 @@ def bearings():
 
 @app.post("/predict")
 def predict(payload: dict):
-    fault = str(payload.get("fault", "outer"))
-    sev = float(payload.get("severity", payload.get("anomaly", 0.0)))
+    # Pure physical sensor inputs
+    vib = float(payload.get("vib_rms", 0.12))
+    curr = float(payload.get("current", 2.30))
+    temp = float(payload.get("temp", 46.0))
+    rpm = float(payload.get("rpm", 1500.0))
+    pressure = float(payload.get("pressure", 1.0))
+
+    # Match closest benchmark operational condition
+    if rpm < 1200:
+        cond = "N09_M07_F10"
+    elif pressure < 0.7:
+        cond = "N15_M07_F04"
+    elif curr < 2.0:
+        cond = "N15_M01_F10"
+    else:
+        cond = "N15_M07_F10"
+
+    # Compute vibration severity relative to nominal baseline (0.08 - 0.14g is normal, >0.20g is defect)
+    vib_sev = max(0.0, min(1.0, (vib - 0.13) / 0.22))
+    sev = float(payload.get("severity", vib_sev))
+
     window = payload.get("window")
     if window is not None:
         try:
             return infer_window(window)
         except Exception:
             pass
-    # feature-based path: severity LADDER of real demo windows. v1 morphed
-    # healthy<->fault along a line and the model read midpoints as the wrong
-    # race; v2 picks a genuine window from the matching severity rung, so the
-    # selected fault reads faithfully at every slider stop.
+
     try:
         import numpy as np
         m = get_model()
         bank = get_bank()
         if m is not None and bank is not None:
-            cond = str(payload.get("condition", "N15_M07_F10"))
-            if cond not in CONDITIONS:
-                cond = "N15_M07_F10"
-            key = fault if fault in ("healthy", "inner", "outer", "combined") else "outer"
-            health = 100 * (1 - sev)
-            if key == "healthy":
-                # no fault injected: the machine stays healthy all along the slider
-                rung = bank[f"{cond}_healthy"]
-            elif health > 66:
-                rung = bank[f"{cond}_healthy"]
-            elif health > 33:
-                rung = bank[f"{cond}_{'both' if key == 'combined' else key}_mild"]
+            # Autonomously deduce defect mode from sensor physics
+            if sev < 0.18:
+                key = "healthy"
+            elif (sev > 0.60 and curr > 3.2) or (vib > 0.44 and curr > 3.2):
+                key = "both"  # Severe combined dual-race spall under high motor torque drag
+            elif curr > 2.60 or temp > 51.5:
+                key = "inner" # Rotating inner race spall induces torque ripple and friction
             else:
-                rung = bank[f"{cond}_{'both' if key == 'combined' else key}_severe"]
+                key = "outer" # Stationary outer race spall
+
+            if key == "healthy":
+                rung = bank[f"{cond}_healthy"]
+            elif sev < 0.50:
+                rung = bank[f"{cond}_{'both' if key == 'both' else key}_mild"]
+            else:
+                rung = bank[f"{cond}_{'both' if key == 'both' else key}_severe"]
+
             win = rung[np.random.randint(len(rung))].astype(np.float32)
             win += np.random.normal(0, 1, win.shape).astype(np.float32) * 0.005
-            return infer_window(win)
+            result = infer_window(win)
+            result["inferred_key"] = key
+            return result
     except Exception:
         pass
-    return heuristic_probs(sev, fault)
+    return heuristic_probs(sev, "outer" if sev > 0.5 else "healthy")
 
 
 @app.websocket("/simulate/stream")
